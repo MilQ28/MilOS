@@ -287,6 +287,62 @@ extern "C" void kmain() {
     MilOS::Log::write_dec(MilOS::Memory::free_pages());
     MilOS::Log::write("\n");
 
+    // PMM validation tests.
+    const auto free_before = MilOS::Memory::free_pages();
+
+    const auto page1 = MilOS::Memory::allocate_page();
+    const auto page2 = MilOS::Memory::allocate_page();
+    const auto page3 = MilOS::Memory::allocate_page();
+
+    if (page1 == 0 || page2 == 0 || page3 == 0 ||
+        page1 == page2 || page1 == page3 || page2 == page3 ||
+        page1 % MilOS::Memory::PAGE_SIZE != 0 ||
+        page2 % MilOS::Memory::PAGE_SIZE != 0 ||
+        page3 % MilOS::Memory::PAGE_SIZE != 0 ||
+        MilOS::Memory::free_pages() != free_before - 3) {
+        MilOS::Log::error("PMM unique allocation test failed");
+        hcf();
+    }
+
+    // Invalid addresses must not alter allocator state.
+    if (MilOS::Memory::free_page(page1 + 1) ||
+        MilOS::Memory::free_page(0x100000) ||
+        MilOS::Memory::free_pages() != free_before - 3) {
+        MilOS::Log::error("PMM invalid-free protection failed");
+        hcf();
+    }
+
+    if (!MilOS::Memory::free_page(page1) ||
+        MilOS::Memory::free_page(page1)) {
+        MilOS::Log::error("PMM double-free protection failed");
+        hcf();
+    }
+
+    if (!MilOS::Memory::free_page(page2) ||
+        !MilOS::Memory::free_page(page3) ||
+        MilOS::Memory::free_pages() != free_before) {
+        MilOS::Log::error("PMM release test failed");
+        hcf();
+    }
+
+    MilOS::Log::info("PMM validation tests passed");
+
+    MilOS::Log::write("[INFO] Tested page 1: ");
+    MilOS::Log::write_hex(page1);
+    MilOS::Log::write("\n");
+
+    MilOS::Log::write("[INFO] Tested page 2: ");
+    MilOS::Log::write_hex(page2);
+    MilOS::Log::write("\n");
+
+    MilOS::Log::write("[INFO] Tested page 3: ");
+    MilOS::Log::write_hex(page3);
+    MilOS::Log::write("\n");
+
+    MilOS::Log::write("[INFO] Free pages restored: ");
+    MilOS::Log::write_dec(MilOS::Memory::free_pages());
+    MilOS::Log::write("\n");
+
     if (framebuffer_request.response == nullptr
      || framebuffer_request.response->framebuffer_count < 1) {
         MilOS::Log::error("Framebuffer unavailable");

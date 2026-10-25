@@ -9,6 +9,7 @@ constexpr std::uint64_t MIN_USABLE_ADDRESS = 0x100000;
 constexpr std::uint64_t INVALID_ADDRESS = ~std::uint64_t{0};
 
 std::uint8_t* bitmap = nullptr;
+std::uint8_t* allocated_bitmap = nullptr;
 std::uint64_t page_count = 0;
 std::uint64_t free_count = 0;
 std::uint64_t physical_limit = 0;
@@ -25,6 +26,21 @@ void set_bit(std::uint64_t i) {
 
 void clear_bit(std::uint64_t i) {
     bitmap[i / BITS_PER_BYTE] &=
+        static_cast<std::uint8_t>(~(1u << (i % BITS_PER_BYTE)));
+}
+
+bool allocated_bit_is_set(std::uint64_t i) {
+    return (allocated_bitmap[i / BITS_PER_BYTE] &
+            (1u << (i % BITS_PER_BYTE))) != 0;
+}
+
+void set_allocated_bit(std::uint64_t i) {
+    allocated_bitmap[i / BITS_PER_BYTE] |=
+        static_cast<std::uint8_t>(1u << (i % BITS_PER_BYTE));
+}
+
+void clear_allocated_bit(std::uint64_t i) {
+    allocated_bitmap[i / BITS_PER_BYTE] &=
         static_cast<std::uint8_t>(~(1u << (i % BITS_PER_BYTE)));
 }
 
@@ -64,8 +80,12 @@ bool init(std::uint64_t hhdm_offset, limine_memmap_response* memmap) {
         (page_count % BITS_PER_BYTE != 0);
 
     const std::uint64_t storage_size = align_up(bitmap_bytes);
-    if (storage_size == INVALID_ADDRESS)
+    if (storage_size == INVALID_ADDRESS ||
+        storage_size > INVALID_ADDRESS / 2)
         return false;
+
+    // Dua bitmap: status semua halaman dan status alokasi PMM.
+    const std::uint64_t total_storage_size = storage_size * 2;
 
     std::uint64_t bitmap_physical = INVALID_ADDRESS;
 
@@ -82,7 +102,7 @@ bool init(std::uint64_t hhdm_offset, limine_memmap_response* memmap) {
         if (candidate == INVALID_ADDRESS || candidate >= region_end)
             continue;
 
-        if (storage_size <= region_end - candidate) {
+        if (total_storage_size <= region_end - candidate) {
             bitmap_physical = candidate;
             break;
         }
@@ -95,10 +115,16 @@ bool init(std::uint64_t hhdm_offset, limine_memmap_response* memmap) {
     auto* candidate_bitmap = reinterpret_cast<std::uint8_t*>(
         hhdm_offset + bitmap_physical);
 
-    for (std::uint64_t i = 0; i < bitmap_bytes; ++i)
+    auto* candidate_allocated_bitmap =
+        candidate_bitmap + storage_size;
+
+    for (std::uint64_t i = 0; i < bitmap_bytes; ++i) {
         candidate_bitmap[i] = 0xFF;
+        candidate_allocated_bitmap[i] = 0;
+    }
 
     bitmap = candidate_bitmap;
+    allocated_bitmap = candidate_allocated_bitmap;
     physical_limit = max_address;
 
     for (std::uint64_t i = 0; i < memmap->entry_count; ++i) {
@@ -119,7 +145,7 @@ bool init(std::uint64_t hhdm_offset, limine_memmap_response* memmap) {
             clear_bit(address / PAGE_SIZE);
     }
 
-    const auto bitmap_end = bitmap_physical + storage_size;
+    const auto bitmap_end = bitmap_physical + total_storage_size;
     for (auto address = bitmap_physical;
          address < bitmap_end; address += PAGE_SIZE)
         set_bit(address / PAGE_SIZE);
@@ -141,6 +167,7 @@ std::uint64_t allocate_page() {
          i < page_count; ++i) {
         if (!bit_is_set(i)) {
             set_bit(i);
+            set_allocated_bit(i);
             --free_count;
             return i * PAGE_SIZE;
         }
@@ -157,11 +184,14 @@ bool free_page(std::uint64_t physical_address) {
 
     const auto index = physical_address / PAGE_SIZE;
 
-    if (bit_is_set(index))
+    // Hanya halaman yang dialokasikan oleh PMM boleh dibebaskan.
+    if (!allocated_bit_is_set(index))
         return false;
 
-    // Halaman yang sudah bebas tidak boleh dibebaskan lagi.
-    return false;
+    clear_allocated_bit(index);
+    clear_bit(index);
+    ++free_count;
+    return true;
 }
 
 std::uint64_t total_pages() {
