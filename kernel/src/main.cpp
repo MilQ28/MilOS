@@ -3,6 +3,7 @@
 #include <limine.h>
 #include "serial.hpp"
 #include <pmm.hpp>
+#include <vmm.hpp>
 
 // Set the base revision to 6, this is recommended as this is the latest
 // base revision described by the Limine boot protocol specification.
@@ -41,6 +42,13 @@ volatile limine_memmap_request memmap_request = {
 __attribute__((used, section(".limine_requests")))
 volatile limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile limine_executable_address_request executable_address_request = {
+    .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID,
     .revision = 0,
     .response = nullptr
 };
@@ -342,6 +350,122 @@ extern "C" void kmain() {
     MilOS::Log::write("[INFO] Free pages restored: ");
     MilOS::Log::write_dec(MilOS::Memory::free_pages());
     MilOS::Log::write("\n");
+
+#if defined(__x86_64__)
+    const auto free_before_vmm = MilOS::Memory::free_pages();
+    if (!MilOS::Memory::vmm_init(
+            hhdm_request.response->offset,
+            const_cast<limine_memmap_response*>(
+                memmap_request.response))) {
+        MilOS::Log::error("VMM initialization failed");
+        hcf();
+    }
+
+    MilOS::Log::write("[INFO] Active paging levels: ");
+    MilOS::Log::write_dec(MilOS::Memory::paging_levels());
+    MilOS::Log::write("\n");
+
+    const auto kernel_virtual_address =
+        reinterpret_cast<std::uint64_t>(&kmain);
+    std::uint64_t kernel_physical_address;
+    std::uint64_t kernel_page_size;
+    if (executable_address_request.response == nullptr ||
+        kernel_virtual_address <
+            executable_address_request.response->virtual_base) {
+        MilOS::Log::error("Limine executable address unavailable");
+        hcf();
+    }
+
+    const auto kernel_offset =
+        kernel_virtual_address -
+        executable_address_request.response->virtual_base;
+    if (executable_address_request.response->physical_base >
+        ~std::uint64_t{0} - kernel_offset) {
+        MilOS::Log::error("Expected kernel physical address overflowed");
+        hcf();
+    }
+
+    const auto expected_kernel_physical =
+        executable_address_request.response->physical_base + kernel_offset;
+    if (!MilOS::Memory::translate(
+            kernel_virtual_address,
+            kernel_physical_address,
+            &kernel_page_size) ||
+        kernel_physical_address != expected_kernel_physical ||
+        (kernel_page_size != MilOS::Memory::PAGE_SIZE &&
+         kernel_page_size != (1ull << 21) &&
+         kernel_page_size != (1ull << 30))) {
+        MilOS::Log::error("VMM kernel-symbol translation failed");
+        hcf();
+    }
+    MilOS::Log::info("VMM kernel-symbol translation passed");
+
+    const auto root_physical_address =
+        MilOS::Memory::active_root_physical_address();
+    if (root_physical_address >
+        ~std::uint64_t{0} - hhdm_request.response->offset) {
+        MilOS::Log::error("VMM HHDM test address overflowed");
+        hcf();
+    }
+
+    const auto root_hhdm_address =
+        hhdm_request.response->offset + root_physical_address;
+    std::uint64_t translated_root = 0;
+    std::uint64_t root_page_size = 0;
+    const bool root_translation_succeeded = MilOS::Memory::translate(
+        root_hhdm_address, translated_root, &root_page_size);
+    if (!root_translation_succeeded ||
+        translated_root != root_physical_address ||
+        (root_page_size != MilOS::Memory::PAGE_SIZE &&
+         root_page_size != (1ull << 21) &&
+         root_page_size != (1ull << 30))) {
+        MilOS::Log::write("[ERROR] Root physical address: ");
+        MilOS::Log::write_hex(root_physical_address);
+        MilOS::Log::write(" HHDM virtual address: ");
+        MilOS::Log::write_hex(root_hhdm_address);
+        MilOS::Log::write(" translated: ");
+        MilOS::Log::write_hex(translated_root);
+        MilOS::Log::write(" page size: ");
+        MilOS::Log::write_hex(root_page_size);
+        MilOS::Log::write("\n");
+        MilOS::Log::error("VMM HHDM translation failed");
+        hcf();
+    }
+    MilOS::Log::info("VMM HHDM translation passed");
+
+    const auto synthetic_test_failure =
+        MilOS::Memory::vmm_run_synthetic_tests();
+    if (synthetic_test_failure != 0) {
+        MilOS::Log::write("[ERROR] VMM synthetic test case: ");
+        MilOS::Log::write_dec(synthetic_test_failure);
+        MilOS::Log::write("\n");
+        MilOS::Log::error("VMM synthetic walker tests failed");
+        hcf();
+    }
+    MilOS::Log::info("VMM walker, mapping, and address-space tests passed");
+
+    // Limine base revision 1 and later do not provide an identity mapping.
+    std::uint64_t null_translation = ~std::uint64_t{0};
+    if (MilOS::Memory::translate(0, null_translation) ||
+        null_translation != ~std::uint64_t{0}) {
+        MilOS::Log::error("VMM unmapped-address rejection failed");
+        hcf();
+    }
+    MilOS::Log::info("VMM unmapped-address rejection passed");
+
+    if (kernel_page_size > MilOS::Memory::PAGE_SIZE ||
+        root_page_size > MilOS::Memory::PAGE_SIZE) {
+        MilOS::Log::info("VMM large-page translation passed");
+    } else {
+        MilOS::Log::info("VMM large-page test not available");
+    }
+
+    if (MilOS::Memory::free_pages() != free_before_vmm) {
+        MilOS::Log::error("VMM changed the PMM free-page count");
+        hcf();
+    }
+    MilOS::Log::info("VMM preserved the PMM free-page count");
+#endif
 
     if (framebuffer_request.response == nullptr
      || framebuffer_request.response->framebuffer_count < 1) {

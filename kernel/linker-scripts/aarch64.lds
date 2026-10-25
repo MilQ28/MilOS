@@ -1,8 +1,8 @@
 /* Tell the linker that we want an aarch64 ELF64 output file */
 OUTPUT_FORMAT(elf64-littleaarch64)
 
-/* We want the symbol kmain to be our entry point */
-ENTRY(kmain)
+/* The architecture-specific entry shim aligns the Limine-provided stack. */
+ENTRY(_start)
 
 /* Define the program headers we want so the bootloader gives us the right */
 /* MMU permissions; this also allows us to exert more control over the linking */
@@ -34,6 +34,9 @@ SECTIONS
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .text : {
+        KEEP(*(.text.entry))
+        KEEP(*(.text.vectors))
+        KEEP(*(.text.exceptions))
         *(.text .text.*)
     } :text
 
@@ -70,7 +73,7 @@ SECTIONS
         __init_array_end = .;
     } :data
 
-    /* Clang 10 and older emit constructors for x86 into .ctors instead, which we run */
+    /* Clang 10 and older may emit constructors into .ctors, which we run */
     /* backwards: their names count down from 65535 by priority, so sorted by name */
     /* they run in priority order. */
     .ctors : {

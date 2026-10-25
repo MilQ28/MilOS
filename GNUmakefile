@@ -25,6 +25,8 @@ else
     ifeq ($(ARCH),aarch64)
         override QEMU_CPU := cortex-a72
         override LIMINE_EFI := BOOTAA64.EFI
+        override QEMU_MACHINE_EXTRA_FLAGS := \
+            -semihosting-config enable=on,target=native
     endif
     ifeq ($(ARCH),riscv64)
         override QEMU_CPU := rv64
@@ -40,7 +42,8 @@ else
         -device ramfb \
         -device qemu-xhci \
         -device usb-kbd \
-        -device usb-tablet
+        -device usb-tablet \
+        $(QEMU_MACHINE_EXTRA_FLAGS)
 endif
 override QEMU_UEFI_FLAGS := \
     -drive if=pflash,unit=0,format=raw,file=edk2-ovmf-bins/ovmf-code-$(ARCH).fd,readonly=on

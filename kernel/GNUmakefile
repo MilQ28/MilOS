@@ -350,6 +350,9 @@ endif
 ifeq ($(ARCH),aarch64)
     override CFLAGS += $(call CC_FLAG,-mbranch-protection=none)
     override CXXFLAGS += $(call CXX_FLAG,-mbranch-protection=none)
+    ifeq ($(AARCH64_EXCEPTION_TEST),1)
+        override CXXFLAGS += -DMILOS_AARCH64_EXCEPTION_TEST=1
+    endif
     # Only the linker can work around Cortex-A53 erratum 843419, so
     # require one that can.
     ifeq ($(call LD_HAS_FLAG,--fix-cortex-a53-843419),1)
@@ -491,12 +494,15 @@ ifeq ($(call LD_HAS_FLAG,-no-pie),1)
         -Wl,-no-pie
 endif
 
-# Use "find" to glob all *.c, *.cpp, *.S, and *.asm files in the tree
-# (except the src/arch/* directories, as those are gonna be added
-# in the next step).
+# Keep the first AArch64 kernel isolated from the x86-64 memory and boot code.
+ifeq ($(ARCH),aarch64)
+override SRCFILES := $(shell find -L src/arch/aarch64 freestanding-lgrt/src -type f 2>/dev/null | LC_ALL=C sort) src/memory.cpp
+else
+# Use "find" to glob all common sources except architecture-specific files.
 override SRCFILES := $(shell find -L src freestanding-lgrt/src -type f ! -path 'src/arch/*' 2>/dev/null | LC_ALL=C sort)
 # Add architecture specific files, if they exist.
 override SRCFILES += $(shell find -L src/arch/$(ARCH) -type f 2>/dev/null | LC_ALL=C sort)
+endif
 # Obtain the object and header dependencies file names.
 override CFILES := $(filter %.c,$(SRCFILES))
 override CXXFILES := $(filter %.cpp,$(SRCFILES))
