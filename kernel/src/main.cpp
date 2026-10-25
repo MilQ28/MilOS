@@ -1,6 +1,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <limine.h>
+#include "serial.hpp"
+#include <pmm.hpp>
 
 // Set the base revision to 6, this is recommended as this is the latest
 // base revision described by the Limine boot protocol specification.
@@ -26,6 +28,24 @@ volatile limine_framebuffer_request framebuffer_request = {
     .revision = 0,
     .response = nullptr
 };
+
+namespace {
+
+__attribute__((used, section(".limine_requests")))
+volatile limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr
+};
+
+}
 
 }
 
@@ -185,10 +205,56 @@ void fb_pattern(limine_framebuffer *fb) {
 // If renaming kmain() to something else, make sure to change the
 // linker script accordingly.
 extern "C" void kmain() {
-    // Ensure the bootloader actually understands our base revision (see spec).
+    MilOS::Log::init();
+    MilOS::Log::info("MilOS kernel entered");
+
     if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false) {
+        MilOS::Log::error("Unsupported Limine base revision");
         hcf();
     }
+
+    MilOS::Log::info("Limine protocol check passed");
+
+    if (memmap_request.response == nullptr) {
+        MilOS::Log::error("Memory map unavailable");
+        hcf();
+    }
+
+    MilOS::Log::info("Memory map received");
+
+    std::uint64_t usable_bytes = 0;
+    std::uint64_t usable_regions = 0;
+
+    for (std::uint64_t i = 0;
+         i < memmap_request.response->entry_count; i++) {
+
+        limine_memmap_entry* entry =
+            memmap_request.response->entries[i];
+
+        MilOS::Log::write("[INFO] Region ");
+        MilOS::Log::write_dec(i);
+        MilOS::Log::write(": base=");
+        MilOS::Log::write_hex(entry->base);
+        MilOS::Log::write(" length=");
+        MilOS::Log::write_hex(entry->length);
+        MilOS::Log::write(" type=");
+        MilOS::Log::write_dec(entry->type);
+        MilOS::Log::write("\n");
+
+        if (entry->type == LIMINE_MEMMAP_USABLE) {
+            usable_bytes += entry->length;
+            usable_regions++;
+        }
+    }
+
+    MilOS::Log::write("[INFO] Usable regions: ");
+    MilOS::Log::write_dec(usable_regions);
+    MilOS::Log::write("\n");
+
+    MilOS::Log::write("[INFO] Total usable RAM bytes: ");
+    MilOS::Log::write_dec(usable_bytes);
+    MilOS::Log::write("\n");
+
 
     // Call global constructors.
     for (void (**ctor)() = __init_array_start; ctor < __init_array_end;) {
@@ -198,24 +264,51 @@ extern "C" void kmain() {
         (*--ctor)();
     }
 
-    // Ensure we got a framebuffer.
-    if (framebuffer_request.response == nullptr
-     || framebuffer_request.response->framebuffer_count < 1) {
+    if (hhdm_request.response == nullptr) {
+        MilOS::Log::error("HHDM unavailable");
         hcf();
     }
 
-    // Print the pattern to every framebuffer.
-    for (std::uint64_t i = 0; i < framebuffer_request.response->framebuffer_count; i++) {
-        limine_framebuffer *framebuffer = framebuffer_request.response->framebuffers[i];
+    if (!MilOS::Memory::init(
+            hhdm_request.response->offset,
+            const_cast<limine_memmap_response*>(
+                memmap_request.response))) {
+        MilOS::Log::error("PMM initialization failed");
+        hcf();
+    }
 
-        // Ensure the framebuffer has 32-bit RGB pixels, the only kind we handle.
-        if (framebuffer->memory_model != LIMINE_FRAMEBUFFER_RGB || framebuffer->bpp != 32) {
+    MilOS::Log::info("Physical memory manager initialized");
+
+    MilOS::Log::write("[INFO] Total physical pages: ");
+    MilOS::Log::write_dec(MilOS::Memory::total_pages());
+    MilOS::Log::write("\n");
+
+    MilOS::Log::write("[INFO] Free physical pages: ");
+    MilOS::Log::write_dec(MilOS::Memory::free_pages());
+    MilOS::Log::write("\n");
+
+    if (framebuffer_request.response == nullptr
+     || framebuffer_request.response->framebuffer_count < 1) {
+        MilOS::Log::error("Framebuffer unavailable");
+        hcf();
+    }
+
+    MilOS::Log::info("Framebuffer initialized");
+
+    for (std::uint64_t i = 0;
+         i < framebuffer_request.response->framebuffer_count; i++) {
+        limine_framebuffer *framebuffer =
+            framebuffer_request.response->framebuffers[i];
+
+        if (framebuffer->memory_model != LIMINE_FRAMEBUFFER_RGB
+         || framebuffer->bpp != 32) {
+            MilOS::Log::error("Unsupported framebuffer format");
             hcf();
         }
 
         fb_pattern(framebuffer);
     }
 
-    // We're done, just hang...
+    MilOS::Log::info("Boot screen rendered");
     hcf();
 }
