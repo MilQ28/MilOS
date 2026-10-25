@@ -50,6 +50,36 @@ inline void write(const char* message) {
     }
 }
 
+inline void write_hex(std::uint64_t value) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    char buffer[16];
+    int i = 0;
+
+    do {
+        buffer[i++] = digits[value & 0xF];
+        value >>= 4;
+    } while (value != 0);
+
+    write("0x");
+    while (i > 0) {
+        putchar(buffer[--i]);
+    }
+}
+
+inline void write_dec(std::uint64_t value) {
+    char buffer[20];
+    int i = 0;
+
+    do {
+        buffer[i++] = '0' + (value % 10);
+        value /= 10;
+    } while (value != 0);
+
+    while (i > 0) {
+        putchar(buffer[--i]);
+    }
+}
+
 inline void info(const char* message) {
     write("[INFO] ");
     write(message);
@@ -68,6 +98,8 @@ inline void init() {}
 inline void write(const char*) {}
 inline void info(const char*) {}
 inline void error(const char*) {}
+inline void write_hex(std::uint64_t) {}
+inline void write_dec(std::uint64_t) {}
 
 #endif
 
