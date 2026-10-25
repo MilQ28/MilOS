@@ -101,17 +101,83 @@ std::uint32_t fb_pixel(limine_framebuffer *fb, std::uint8_t red, std::uint8_t gr
          | fb_channel(blue, fb->blue_mask_size, fb->blue_mask_shift);
 }
 
-// Print a nice pattern to a framebuffer as an example.
+
+// Return one row of a simple 5x7 bitmap font.
+std::uint8_t glyph_row(char c, std::size_t row) {
+    static const std::uint8_t blank[7] = {};
+    const std::uint8_t *g = blank;
+
+    static const std::uint8_t M[7] = {17, 27, 21, 21, 17, 17, 17};
+    static const std::uint8_t I[7] = {31, 4, 4, 4, 4, 4, 31};
+    static const std::uint8_t L[7] = {16, 16, 16, 16, 16, 16, 31};
+    static const std::uint8_t O[7] = {14, 17, 17, 17, 17, 17, 14};
+    static const std::uint8_t S[7] = {15, 16, 16, 14, 1, 1, 30};
+    static const std::uint8_t B[7] = {30, 17, 17, 30, 17, 17, 30};
+    static const std::uint8_t T[7] = {31, 4, 4, 4, 4, 4, 4};
+    static const std::uint8_t E[7] = {31, 16, 16, 30, 16, 16, 31};
+    static const std::uint8_t D[7] = {30, 17, 17, 17, 17, 17, 30};
+
+    switch (c) {
+        case 'M': g = M; break;
+        case 'I': g = I; break;
+        case 'L': g = L; break;
+        case 'O': g = O; break;
+        case 'S': g = S; break;
+        case 'B': g = B; break;
+        case 'T': g = T; break;
+        case 'E': g = E; break;
+        case 'D': g = D; break;
+        default: break;
+    }
+
+    return g[row];
+}
+
 void fb_pattern(limine_framebuffer *fb) {
-    volatile std::uint32_t *fb_ptr = static_cast<volatile std::uint32_t *>(fb->address);
-    for (std::size_t y = 0; y < fb->height; y++) {
-        for (std::size_t x = 0; x < fb->width; x++) {
-            std::uint8_t nX = x * 255 / fb->width;
-            std::uint8_t nY = y * 255 / fb->height;
-            fb_ptr[y * (fb->pitch / 4) + x] = fb_pixel(fb, 0, nY, nX);
+    auto *pixels = static_cast<volatile std::uint32_t *>(fb->address);
+
+    // Dark background.
+    for (std::size_t y = 0; y < fb->height; ++y) {
+        for (std::size_t x = 0; x < fb->width; ++x) {
+            pixels[y * (fb->pitch / 4) + x] =
+                fb_pixel(fb, 18, 18, 26);
+        }
+    }
+
+    const char text[] = "MILOS BOOTED";
+    const std::size_t scale = 4;
+    const std::size_t text_width = (sizeof(text) - 2) * 6 * scale;
+    const std::size_t start_x =
+        fb->width > text_width ? (fb->width - text_width) / 2 : 0;
+    const std::size_t start_y = fb->height / 2 - 14;
+
+    for (std::size_t i = 0; text[i] != '\0'; ++i) {
+        for (std::size_t row = 0; row < 7; ++row) {
+            const std::uint8_t bits = glyph_row(text[i], row);
+
+            for (std::size_t col = 0; col < 5; ++col) {
+                if ((bits & (1u << (4 - col))) == 0) {
+                    continue;
+                }
+
+                for (std::size_t dy = 0; dy < scale; ++dy) {
+                    for (std::size_t dx = 0; dx < scale; ++dx) {
+                        const std::size_t x =
+                            start_x + (i * 6 + col) * scale + dx;
+                        const std::size_t y =
+                            start_y + row * scale + dy;
+
+                        if (x < fb->width && y < fb->height) {
+                            pixels[y * (fb->pitch / 4) + x] =
+                                fb_pixel(fb, 240, 240, 245);
+                        }
+                    }
+                }
+            }
         }
     }
 }
+
 
 }
 
