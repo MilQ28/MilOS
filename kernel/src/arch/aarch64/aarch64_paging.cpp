@@ -15,6 +15,7 @@ constexpr std::uint64_t RESERVED_ADDRESS_HIGH_MASK =
 constexpr std::uint64_t TABLE_DESCRIPTOR_RESERVED_LOW_MASK = 0xffc;
 constexpr std::uint64_t INVALID_VALUE = ~std::uint64_t{0};
 constexpr std::uint32_t MAX_TABLE_PAGES = 4096;
+constexpr std::uint32_t MAX_SNAPSHOT_TABLE_PAGES = 4096;
 constexpr std::uint8_t REQUIRED_VA_BITS = 48;
 constexpr std::uint8_t REQUIRED_LEVELS = 4;
 constexpr std::uint8_t DEVICE_ATTRIBUTE_INDEX = 0;
@@ -73,6 +74,14 @@ struct SyntheticMemory {
     std::uint32_t page_count;
     bool accessible;
 };
+
+struct SnapshotTablePage {
+    std::uint64_t physical_address;
+    std::uint8_t level;
+};
+
+// Shared scratch keeps the bounded traversal off the boot stack.
+SnapshotTablePage snapshot_table_pages[MAX_SNAPSHOT_TABLE_PAGES]{};
 
 bool add_without_overflow(
     std::uint64_t left,
@@ -484,6 +493,117 @@ bool live_read_entry(
     return true;
 }
 
+std::uint64_t checksum_word(std::uint64_t checksum, std::uint64_t word) {
+    for (std::uint32_t byte = 0; byte < sizeof(word); ++byte) {
+        checksum ^= static_cast<std::uint8_t>(word >> (byte * 8));
+        checksum *= 1099511628211ull;
+    }
+    return checksum;
+}
+
+RootScanStatus snapshot_table_root(
+    std::uint64_t root,
+    const SyntheticWalkConfig& config,
+    EntryReader read_entry,
+    void* reader_context,
+    std::uint64_t& page_count,
+    std::uint64_t& checksum,
+    std::uint64_t* output_pages = nullptr,
+    std::uint64_t output_capacity = 0,
+    std::uint64_t* output_count = nullptr
+) {
+    if (root == 0 || (root & PAGE_MASK) != 0)
+        return RootScanStatus::inaccessible_table;
+
+    snapshot_table_pages[0] = {root, 0};
+    page_count = 1;
+    checksum = checksum_word(1469598103934665603ull, root);
+    const std::uint64_t physical_mask =
+        ((std::uint64_t{1} << config.physical_address_bits) - 1) &
+        ~PAGE_MASK;
+
+    for (std::uint32_t cursor = 0; cursor < page_count; ++cursor) {
+        const SnapshotTablePage current = snapshot_table_pages[cursor];
+        checksum = checksum_word(checksum, current.physical_address);
+        for (std::uint16_t index = 0; index < 512; ++index) {
+            std::uint64_t descriptor = 0;
+            if (!read_entry(
+                    reader_context,
+                    current.physical_address,
+                    index,
+                    descriptor))
+                return RootScanStatus::inaccessible_table;
+            checksum = checksum_word(checksum, descriptor);
+            if ((descriptor & DESCRIPTOR_VALID) == 0)
+                continue;
+
+            const bool is_table =
+                (descriptor & DESCRIPTOR_TYPE) != 0;
+            const std::uint8_t level = current.level;
+            if (level == REQUIRED_LEVELS - 1) {
+                if (!is_table)
+                    return RootScanStatus::malformed_descriptor;
+                continue;
+            }
+            if (!is_table) {
+                if (level == 0)
+                    return RootScanStatus::malformed_descriptor;
+                continue;
+            }
+
+            if ((descriptor & RESERVED_ADDRESS_HIGH_MASK) != 0 ||
+                (descriptor & TABLE_DESCRIPTOR_RESERVED_LOW_MASK) != 0 ||
+                (descriptor & ADDRESS_FIELD_MASK & ~physical_mask) != 0)
+                return RootScanStatus::malformed_descriptor;
+
+            const std::uint64_t child =
+                descriptor & physical_mask;
+            bool already_queued = false;
+            for (std::uint64_t queued = 0;
+                 queued < page_count;
+                 ++queued) {
+                if (snapshot_table_pages[queued].physical_address == child) {
+                    if (snapshot_table_pages[queued].level != level + 1)
+                        return RootScanStatus::malformed_descriptor;
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (already_queued)
+                continue;
+            if (page_count == MAX_SNAPSHOT_TABLE_PAGES)
+                return RootScanStatus::budget_exhausted;
+            snapshot_table_pages[page_count] = {
+                child,
+                static_cast<std::uint8_t>(level + 1)
+            };
+            ++page_count;
+        }
+    }
+    if (output_pages != nullptr || output_count != nullptr ||
+        output_capacity != 0) {
+        if (output_pages == nullptr || output_count == nullptr)
+            return RootScanStatus::budget_exhausted;
+        for (std::uint64_t i = 0; i < page_count; ++i) {
+            const std::uint64_t physical =
+                snapshot_table_pages[i].physical_address;
+            bool already_present = false;
+            for (std::uint64_t j = 0; j < *output_count; ++j) {
+                if (output_pages[j] == physical) {
+                    already_present = true;
+                    break;
+                }
+            }
+            if (already_present)
+                continue;
+            if (*output_count >= output_capacity)
+                return RootScanStatus::budget_exhausted;
+            output_pages[(*output_count)++] = physical;
+        }
+    }
+    return RootScanStatus::complete;
+}
+
 void fail_scan(ScanContext& context, RootScanStatus status) {
     if (context.status == RootScanStatus::complete)
         context.status = status;
@@ -743,6 +863,160 @@ RegimeStatus detect_regime(
     return RegimeStatus::supported;
 }
 
+ActiveTableSnapshot snapshot_active_tables(
+    const RegisterSnapshot& registers,
+    std::uint64_t hhdm_offset,
+    const limine_memmap_response* memory_map,
+    std::uint64_t* table_page_addresses,
+    std::uint64_t table_page_capacity,
+    std::uint64_t* table_page_count
+) {
+    if (table_page_count != nullptr)
+        *table_page_count = 0;
+    ActiveTableSnapshot snapshot{
+        RootScanStatus::unsupported_regime,
+        RootScanStatus::unsupported_regime,
+        0,
+        1469598103934665603ull
+    };
+    Regime regime{};
+    if (detect_regime(registers, regime) != RegimeStatus::supported)
+        return snapshot;
+    const bool inventory_requested =
+        table_page_addresses != nullptr ||
+        table_page_capacity != 0 ||
+        table_page_count != nullptr;
+    if (inventory_requested &&
+        (table_page_addresses == nullptr ||
+         table_page_capacity == 0 ||
+         table_page_count == nullptr))
+        return snapshot;
+
+    const SyntheticWalkConfig config{
+        0,
+        registers.mair_el1,
+        regime.physical_address_bits,
+        regime.virtual_address_bits,
+        regime.levels,
+        false
+    };
+    LiveReaderContext reader_context{
+        hhdm_offset,
+        memory_map,
+        0,
+        false
+    };
+    const std::uint64_t ttbr0_root =
+        registers.ttbr0_el1 & regime.physical_address_mask;
+    const std::uint64_t ttbr1_root =
+        registers.ttbr1_el1 & regime.physical_address_mask;
+    std::uint64_t ttbr0_pages = 0;
+    std::uint64_t ttbr1_pages = 0;
+    std::uint64_t ttbr0_checksum = 0;
+    std::uint64_t ttbr1_checksum = 0;
+    snapshot.ttbr0_status = snapshot_table_root(
+        ttbr0_root,
+        config,
+        live_read_entry,
+        &reader_context,
+        ttbr0_pages,
+        ttbr0_checksum,
+        table_page_addresses,
+        table_page_capacity,
+        table_page_count
+    );
+    snapshot.ttbr1_status = snapshot_table_root(
+        ttbr1_root,
+        config,
+        live_read_entry,
+        &reader_context,
+        ttbr1_pages,
+        ttbr1_checksum,
+        table_page_addresses,
+        table_page_capacity,
+        table_page_count
+    );
+    if ((snapshot.ttbr0_status != RootScanStatus::complete ||
+         snapshot.ttbr1_status != RootScanStatus::complete) &&
+        table_page_count != nullptr)
+        *table_page_count = 0;
+    snapshot.table_pages_scanned = ttbr0_pages + ttbr1_pages;
+    snapshot.checksum = checksum_word(
+        checksum_word(snapshot.checksum, ttbr0_checksum),
+        ttbr1_checksum
+    );
+    return snapshot;
+}
+
+ActiveTranslation translate_active_address(
+    const RegisterSnapshot& registers,
+    std::uint64_t hhdm_offset,
+    const limine_memmap_response* memory_map,
+    std::uint64_t virtual_address
+) {
+    ActiveTranslation result{};
+    result.status = ActiveTranslationStatus::unsupported_regime;
+
+    Regime regime{};
+    if (detect_regime(registers, regime) != RegimeStatus::supported)
+        return result;
+
+    constexpr std::uint64_t LOWER_LIMIT =
+        (std::uint64_t{1} << REQUIRED_VA_BITS) - 1;
+    constexpr std::uint64_t UPPER_BASE =
+        INVALID_VALUE - LOWER_LIMIT;
+    const bool upper = virtual_address >= UPPER_BASE;
+    if (!upper && virtual_address > LOWER_LIMIT) {
+        result.status = ActiveTranslationStatus::invalid_address;
+        return result;
+    }
+
+    const SyntheticWalkConfig config{
+        upper
+            ? registers.ttbr1_el1 & regime.physical_address_mask
+            : registers.ttbr0_el1 & regime.physical_address_mask,
+        registers.mair_el1,
+        regime.physical_address_bits,
+        regime.virtual_address_bits,
+        regime.levels,
+        upper
+    };
+    LiveReaderContext reader_context{
+        hhdm_offset,
+        memory_map,
+        0,
+        false
+    };
+    const WalkResult walked = walk_address(
+        config,
+        live_read_entry,
+        &reader_context,
+        virtual_address
+    );
+    switch (walked.status) {
+        case WalkStatus::mapped:
+            result.status = ActiveTranslationStatus::mapped;
+            result.mapping = walked.mapping;
+            break;
+        case WalkStatus::unmapped:
+            result.status = ActiveTranslationStatus::unmapped;
+            break;
+        case WalkStatus::invalid_input:
+            result.status = ActiveTranslationStatus::invalid_address;
+            break;
+        case WalkStatus::unsupported_configuration:
+            result.status = ActiveTranslationStatus::unsupported_regime;
+            break;
+        case WalkStatus::inaccessible_table:
+            result.status = ActiveTranslationStatus::inaccessible_table;
+            break;
+        case WalkStatus::malformed_descriptor:
+            result.status = ActiveTranslationStatus::malformed_descriptor;
+            break;
+    }
+    return result;
+}
+
 AuditReport inspect_physical_range(
     const RegisterSnapshot& registers,
     std::uint64_t hhdm_offset,
@@ -943,6 +1217,31 @@ std::uint32_t run_synthetic_tests() {
             result.mapping.memory_type == MemoryType::normal &&
             result.mapping.access_flag))
         return 2;
+
+    memory.pages[3].entries[level3_index + 1] =
+        0x22345000ull |
+        (std::uint64_t{2} << 2) |
+        (std::uint64_t{1} << 6) |
+        (std::uint64_t{3} << 8) |
+        (std::uint64_t{1} << 10) |
+        (std::uint64_t{1} << 53) |
+        (std::uint64_t{1} << 54) |
+        3;
+    const WalkResult next_page = walk_address(
+        config,
+        synthetic_read_entry,
+        &memory,
+        (virtual_address & ~PAGE_MASK) + PAGE_SIZE + 0x45
+    );
+    if (!synthetic_test(
+            next_page.status == WalkStatus::mapped &&
+            next_page.mapping.translated_physical_address ==
+                0x22345045 &&
+            next_page.mapping.size == PAGE_SIZE &&
+            next_page.mapping.physical_base !=
+                result.mapping.physical_base + PAGE_SIZE))
+        return 19;
+    memory.pages[3].entries[level3_index + 1] = 0;
 
     memory.pages[3].entries[level3_index] =
         (memory.pages[3].entries[level3_index] & ~(3ull << 8)) |
@@ -1196,6 +1495,113 @@ std::uint32_t run_synthetic_tests() {
             mappings[0].virtual_address == 0xffff000009000000ull &&
             mappings[0].translated_physical_address == 0x09000000))
         return 22;
+
+    SyntheticMemory snapshot_memory{};
+    snapshot_memory.page_count = 4;
+    snapshot_memory.accessible = true;
+    initialize_synthetic_page(snapshot_memory.pages[0], 0x1000);
+    initialize_synthetic_page(snapshot_memory.pages[1], 0x2000);
+    initialize_synthetic_page(snapshot_memory.pages[2], 0x3000);
+    initialize_synthetic_page(snapshot_memory.pages[3], 0x4000);
+    snapshot_memory.pages[0].entries[0] = 0x2000 | 3;
+    snapshot_memory.pages[1].entries[0] = 0x3000 | 3;
+    snapshot_memory.pages[2].entries[0] = 0x4000 | 3;
+    snapshot_memory.pages[3].entries[0] = 0x12345000ull | 3;
+    std::uint64_t table_page_addresses[4]{};
+    std::uint64_t table_page_count = 0;
+    std::uint64_t scanned_pages = 0;
+    std::uint64_t scan_checksum = 0;
+    RootScanStatus inventory_status = snapshot_table_root(
+        0x1000,
+        config,
+        synthetic_read_entry,
+        &snapshot_memory,
+        scanned_pages,
+        scan_checksum,
+        table_page_addresses,
+        4,
+        &table_page_count
+    );
+    if (!synthetic_test(
+            inventory_status == RootScanStatus::complete &&
+            table_page_count == 4 &&
+            table_page_addresses[0] == 0x1000 &&
+            table_page_addresses[1] == 0x2000 &&
+            table_page_addresses[2] == 0x3000 &&
+            table_page_addresses[3] == 0x4000))
+        return 23;
+
+    inventory_status = snapshot_table_root(
+        0x1000,
+        config,
+        synthetic_read_entry,
+        &snapshot_memory,
+        scanned_pages,
+        scan_checksum,
+        table_page_addresses,
+        4,
+        &table_page_count
+    );
+    if (!synthetic_test(
+            inventory_status == RootScanStatus::complete &&
+            table_page_count == 4))
+        return 24;
+
+    table_page_count = 0;
+    inventory_status = snapshot_table_root(
+        0x1000,
+        config,
+        synthetic_read_entry,
+        &snapshot_memory,
+        scanned_pages,
+        scan_checksum,
+        table_page_addresses,
+        3,
+        &table_page_count
+    );
+    if (!synthetic_test(
+            inventory_status == RootScanStatus::budget_exhausted))
+        return 25;
+
+    snapshot_memory.pages[0].entries[0] = 0x5000 | 3;
+    table_page_count = 0;
+    inventory_status = snapshot_table_root(
+        0x1000,
+        config,
+        synthetic_read_entry,
+        &snapshot_memory,
+        scanned_pages,
+        scan_checksum,
+        table_page_addresses,
+        4,
+        &table_page_count
+    );
+    if (!synthetic_test(
+            inventory_status == RootScanStatus::inaccessible_table &&
+            table_page_count == 0))
+        return 26;
+
+    initialize_synthetic_page(snapshot_memory.pages[0], 0x1000);
+    initialize_synthetic_page(snapshot_memory.pages[1], 0x2000);
+    initialize_synthetic_page(snapshot_memory.pages[2], 0x3000);
+    initialize_synthetic_page(snapshot_memory.pages[3], 0x4000);
+    snapshot_memory.pages[0].entries[0] = 0x2000 | 3;
+    snapshot_memory.pages[1].entries[0] = 0x3000 | 3;
+    snapshot_memory.pages[2].entries[0] = 0x2000 | 3;
+    inventory_status = snapshot_table_root(
+        0x1000,
+        config,
+        synthetic_read_entry,
+        &snapshot_memory,
+        scanned_pages,
+        scan_checksum,
+        table_page_addresses,
+        4,
+        &table_page_count
+    );
+    if (!synthetic_test(
+            inventory_status == RootScanStatus::malformed_descriptor))
+        return 27;
 
     return 0;
 }

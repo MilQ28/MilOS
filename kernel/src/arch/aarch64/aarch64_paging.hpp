@@ -33,7 +33,8 @@ enum class RootScanStatus : std::uint8_t {
     complete,
     inaccessible_table,
     malformed_descriptor,
-    budget_exhausted
+    budget_exhausted,
+    unsupported_regime
 };
 
 enum class AuditStatus : std::uint8_t {
@@ -42,6 +43,15 @@ enum class AuditStatus : std::uint8_t {
     inconclusive,
     unsupported_regime,
     invalid_range
+};
+
+enum class ActiveTranslationStatus : std::uint8_t {
+    mapped,
+    unmapped,
+    invalid_address,
+    unsupported_regime,
+    inaccessible_table,
+    malformed_descriptor
 };
 
 struct Regime {
@@ -90,6 +100,18 @@ struct AuditReport {
     PhysicalRange gaps[MAX_AUDIT_GAPS];
 };
 
+struct ActiveTableSnapshot {
+    RootScanStatus ttbr0_status;
+    RootScanStatus ttbr1_status;
+    std::uint64_t table_pages_scanned;
+    std::uint64_t checksum;
+};
+
+struct ActiveTranslation {
+    ActiveTranslationStatus status;
+    Mapping mapping;
+};
+
 using EntryReader = bool (*)(
     void* context,
     std::uint64_t table_physical_address,
@@ -117,6 +139,20 @@ AuditReport inspect_physical_range(
     const limine_memmap_response* memory_map,
     std::uint64_t physical_base,
     std::uint64_t physical_size
+);
+ActiveTableSnapshot snapshot_active_tables(
+    const RegisterSnapshot& registers,
+    std::uint64_t hhdm_offset,
+    const limine_memmap_response* memory_map,
+    std::uint64_t* table_page_addresses = nullptr,
+    std::uint64_t table_page_capacity = 0,
+    std::uint64_t* table_page_count = nullptr
+);
+ActiveTranslation translate_active_address(
+    const RegisterSnapshot& registers,
+    std::uint64_t hhdm_offset,
+    const limine_memmap_response* memory_map,
+    std::uint64_t virtual_address
 );
 std::uint32_t run_synthetic_tests();
 std::uint32_t run_isolated_device_mapping_tests(

@@ -7,6 +7,12 @@ _start:
     and x9, x9, #0xfffffffffffffff0
 // Limine guarantees 64 KiB below SP; split it into normal and exception stacks.
     sub x10, x9, #32768
+    adrp x12, aarch64_boot_stack_top
+    add x12, x12, :lo12:aarch64_boot_stack_top
+    str x9, [x12]
+    adrp x12, aarch64_boot_normal_stack_top
+    add x12, x12, :lo12:aarch64_boot_normal_stack_top
+    str x10, [x12]
     mrs x11, CurrentEL
     cmp x11, #4
     b.eq 1f
@@ -31,6 +37,15 @@ _start:
     wfi
     b 1b
 .size _start, . - _start
+
+.section .bss.stack_metadata, "aw", %nobits
+.balign 8
+.global aarch64_boot_stack_top
+aarch64_boot_stack_top:
+    .skip 8
+.global aarch64_boot_normal_stack_top
+aarch64_boot_normal_stack_top:
+    .skip 8
 
 .section .text.vectors, "ax"
 .balign 2048

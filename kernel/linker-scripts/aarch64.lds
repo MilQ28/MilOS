@@ -22,28 +22,34 @@ SECTIONS
     /* Any address in this region will do, but often 0xffffffff80000000 is chosen as */
     /* that is the beginning of the region. */
     . = 0xffffffff80000000;
+    __kernel_image_start = .;
 
     /* Define a section to contain the Limine requests and assign it to its own PHDR */
     .limine_requests : {
+        __limine_requests_start = .;
         KEEP(*(.limine_requests_start))
         KEEP(*(.limine_requests))
         KEEP(*(.limine_requests_end))
+        __limine_requests_end = .;
     } :limine_requests
 
     /* Move to the next memory page for .text */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .text : {
+        __text_start = .;
         KEEP(*(.text.entry))
         KEEP(*(.text.vectors))
         KEEP(*(.text.exceptions))
         *(.text .text.*)
+        __text_end = .;
     } :text
 
     /* Move to the next memory page for .rodata */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .rodata : {
+        __rodata_start = .;
         *(.rodata .rodata.*)
     } :rodata
 
@@ -52,6 +58,7 @@ SECTIONS
     .note.gnu.build-id : {
         *(.note.gnu.build-id)
     } :rodata
+    __rodata_end = .;
 
     /* Move to the next memory page for .data */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
@@ -84,6 +91,7 @@ SECTIONS
     } :data
 
     .data : {
+        __writable_start = .;
         *(.data .data.*)
     } :data
 
@@ -93,7 +101,9 @@ SECTIONS
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
+        __writable_end = .;
     } :data
+    __kernel_image_end = .;
 
     /* Discard .note.* and .eh_frame* since they may cause issues on some hosts, */
     /* the GOT, which nothing in the kernel needs but some linkers create, and */
